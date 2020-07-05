@@ -382,6 +382,27 @@ typedef struct open_internal_entity {
   XML_Bool betweenDecl; /* WFC: PE Between Declarations */
 } OPEN_INTERNAL_ENTITY;
 
+enum XML_Account {
+  XML_ACCOUNT_DIRECT,           /* bytes directly passed to the Expat parser */
+  XML_ACCOUNT_ENTITY_EXPANSION, /* intermediate bytes produced during entity
+                                   expansion */
+  XML_ACCOUNT_NONE              /* i.e. do not account, was accounted already */
+};
+
+#ifdef XML_DTD
+typedef long long XmlBigCount;
+typedef struct accounting {
+  XmlBigCount countBytesDirect;
+  XmlBigCount countBytesIndirect;
+} ACCOUNTING;
+
+typedef struct entity_stats {
+  unsigned int countEverOpened;
+  unsigned int currentDepth;
+  unsigned int maximumDepthSeen;
+} ENTITY_STATS;
+#endif /* XML_DTD */
+
 typedef enum XML_Error PTRCALL Processor(XML_Parser parser, const char *start,
                                          const char *end, const char **endPtr);
 
@@ -412,13 +433,14 @@ static enum XML_Error initializeEncoding(XML_Parser parser);
 static enum XML_Error doProlog(XML_Parser parser, const ENCODING *enc,
                                const char *s, const char *end, int tok,
                                const char *next, const char **nextPtr,
-                               XML_Bool haveMore, XML_Bool allowClosingDoctype);
+                               XML_Bool haveMore, XML_Bool allowClosingDoctype,
+                               enum XML_Account account);
 static enum XML_Error processInternalEntity(XML_Parser parser, ENTITY *entity,
                                             XML_Bool betweenDecl);
 static enum XML_Error doContent(XML_Parser parser, int startTagLevel,
                                 const ENCODING *enc, const char *start,
                                 const char *end, const char **endPtr,
-                                XML_Bool haveMore);
+                                XML_Bool haveMore, enum XML_Account account);
 static enum XML_Error doCdataSection(XML_Parser parser, const ENCODING *,
                                      const char **startPtr, const char *end,
                                      const char **nextPtr, XML_Bool haveMore);
@@ -431,7 +453,8 @@ static enum XML_Error doIgnoreSection(XML_Parser parser, const ENCODING *,
 static void freeBindings(XML_Parser parser, BINDING *bindings);
 static enum XML_Error storeAtts(XML_Parser parser, const ENCODING *,
                                 const char *s, TAG_NAME *tagNamePtr,
-                                BINDING **bindingsPtr);
+                                BINDING **bindingsPtr,
+                                enum XML_Account account);
 static enum XML_Error addBinding(XML_Parser parser, PREFIX *prefix,
                                  const ATTRIBUTE_ID *attId, const XML_Char *uri,
                                  BINDING **bindingsPtr);
@@ -440,10 +463,12 @@ static int defineAttribute(ELEMENT_TYPE *type, ATTRIBUTE_ID *, XML_Bool isCdata,
                            XML_Parser parser);
 static enum XML_Error storeAttributeValue(XML_Parser parser, const ENCODING *,
                                           XML_Bool isCdata, const char *,
-                                          const char *, STRING_POOL *);
+                                          const char *, STRING_POOL *,
+                                          enum XML_Account account);
 static enum XML_Error appendAttributeValue(XML_Parser parser, const ENCODING *,
                                            XML_Bool isCdata, const char *,
-                                           const char *, STRING_POOL *);
+                                           const char *, STRING_POOL *,
+                                           enum XML_Account account);
 static ATTRIBUTE_ID *getAttributeId(XML_Parser parser, const ENCODING *enc,
                                     const char *start, const char *end);
 static int setElementTypePrefix(XML_Parser parser, ELEMENT_TYPE *);
@@ -625,6 +650,10 @@ struct XML_ParserStruct {
   enum XML_ParamEntityParsing m_paramEntityParsing;
 #endif
   unsigned long m_hash_secret_salt;
+#ifdef XML_DTD
+  ACCOUNTING m_accounting;
+  ENTITY_STATS m_entity_stats;
+#endif
 };
 
 #define MALLOC(parser, s) (parser->m_mem.malloc_fcn((s)))
@@ -1073,6 +1102,10 @@ parserInit(XML_Parser parser, const XML_Char *encodingName) {
   parser->m_paramEntityParsing = XML_PARAM_ENTITY_PARSING_NEVER;
 #endif
   parser->m_hash_secret_salt = 0;
+#ifdef XML_DTD
+  memset(&parser->m_accounting, 0, sizeof(ACCOUNTING));
+  memset(&parser->m_entity_stats, 0, sizeof(ENTITY_STATS));
+#endif
 }
 
 /* moves list of bindings to m_freeBindingList */
@@ -2460,9 +2493,9 @@ storeRawNames(XML_Parser parser) {
 static enum XML_Error PTRCALL
 contentProcessor(XML_Parser parser, const char *start, const char *end,
                  const char **endPtr) {
-  enum XML_Error result
-      = doContent(parser, 0, parser->m_encoding, start, end, endPtr,
-                  (XML_Bool)! parser->m_parsingStatus.finalBuffer);
+  enum XML_Error result = doContent(
+      parser, 0, parser->m_encoding, start, end, endPtr,
+      (XML_Bool)! parser->m_parsingStatus.finalBuffer, XML_ACCOUNT_DIRECT);
   if (result == XML_ERROR_NONE) {
     if (! storeRawNames(parser))
       return XML_ERROR_NO_MEMORY;
@@ -2480,11 +2513,635 @@ externalEntityInitProcessor(XML_Parser parser, const char *start,
   return externalEntityInitProcessor2(parser, start, end, endPtr);
 }
 
+#ifdef XML_DTD
+static const char *_unsigned_char_to_printable(unsigned char c);
+
+static void _ACCOUNT_DIFF_STR(XML_Parser targetParser, XML_Parser originParser,
+                              int tok, const char *before, const char *after,
+                              int source_line, enum XML_Account account);
+
+static void _ENTITY_PRINT_STATS_PREFIX(XML_Parser parser, ENTITY *entity,
+                                       const char *action, int sourceLine);
+static void _ENTITY_ON_OPEN(XML_Parser parser, ENTITY *entity, int sourceLine);
+static void _ENTITY_ON_CLOSE(XML_Parser parser, ENTITY *entity, int sourceLine);
+
+static const char *
+_unsigned_char_to_printable(unsigned char c) {
+  switch (c) {
+  case 0:
+    return "\\x0";
+  case 1:
+    return "\\x1";
+  case 2:
+    return "\\x2";
+  case 3:
+    return "\\x3";
+  case 4:
+    return "\\x4";
+  case 5:
+    return "\\x5";
+  case 6:
+    return "\\x6";
+  case 7:
+    return "\\x7";
+  case 8:
+    return "\\x8";
+  case 9:
+    return "\\t";
+  case 10:
+    return "\\n";
+  case 11:
+    return "\\xB";
+  case 12:
+    return "\\xC";
+  case 13:
+    return "\\r";
+  case 14:
+    return "\\xE";
+  case 15:
+    return "\\xF";
+  case 16:
+    return "\\x10";
+  case 17:
+    return "\\x11";
+  case 18:
+    return "\\x12";
+  case 19:
+    return "\\x13";
+  case 20:
+    return "\\x14";
+  case 21:
+    return "\\x15";
+  case 22:
+    return "\\x16";
+  case 23:
+    return "\\x17";
+  case 24:
+    return "\\x18";
+  case 25:
+    return "\\x19";
+  case 26:
+    return "\\x1A";
+  case 27:
+    return "\\x1B";
+  case 28:
+    return "\\x1C";
+  case 29:
+    return "\\x1D";
+  case 30:
+    return "\\x1E";
+  case 31:
+    return "\\x1F";
+  case 32:
+    return " ";
+  case 33:
+    return "!";
+  case 34:
+    return "\\\"";
+  case 35:
+    return "#";
+  case 36:
+    return "$";
+  case 37:
+    return "%";
+  case 38:
+    return "&";
+  case 39:
+    return "'";
+  case 40:
+    return "(";
+  case 41:
+    return ")";
+  case 42:
+    return "*";
+  case 43:
+    return "+";
+  case 44:
+    return ",";
+  case 45:
+    return "-";
+  case 46:
+    return ".";
+  case 47:
+    return "/";
+  case 48:
+    return "0";
+  case 49:
+    return "1";
+  case 50:
+    return "2";
+  case 51:
+    return "3";
+  case 52:
+    return "4";
+  case 53:
+    return "5";
+  case 54:
+    return "6";
+  case 55:
+    return "7";
+  case 56:
+    return "8";
+  case 57:
+    return "9";
+  case 58:
+    return ":";
+  case 59:
+    return ";";
+  case 60:
+    return "<";
+  case 61:
+    return "=";
+  case 62:
+    return ">";
+  case 63:
+    return "?";
+  case 64:
+    return "@";
+  case 65:
+    return "A";
+  case 66:
+    return "B";
+  case 67:
+    return "C";
+  case 68:
+    return "D";
+  case 69:
+    return "E";
+  case 70:
+    return "F";
+  case 71:
+    return "G";
+  case 72:
+    return "H";
+  case 73:
+    return "I";
+  case 74:
+    return "J";
+  case 75:
+    return "K";
+  case 76:
+    return "L";
+  case 77:
+    return "M";
+  case 78:
+    return "N";
+  case 79:
+    return "O";
+  case 80:
+    return "P";
+  case 81:
+    return "Q";
+  case 82:
+    return "R";
+  case 83:
+    return "S";
+  case 84:
+    return "T";
+  case 85:
+    return "U";
+  case 86:
+    return "V";
+  case 87:
+    return "W";
+  case 88:
+    return "X";
+  case 89:
+    return "Y";
+  case 90:
+    return "Z";
+  case 91:
+    return "[";
+  case 92:
+    return "\\\\";
+  case 93:
+    return "]";
+  case 94:
+    return "^";
+  case 95:
+    return "_";
+  case 96:
+    return "`";
+  case 97:
+    return "a";
+  case 98:
+    return "b";
+  case 99:
+    return "c";
+  case 100:
+    return "d";
+  case 101:
+    return "e";
+  case 102:
+    return "f";
+  case 103:
+    return "g";
+  case 104:
+    return "h";
+  case 105:
+    return "i";
+  case 106:
+    return "j";
+  case 107:
+    return "k";
+  case 108:
+    return "l";
+  case 109:
+    return "m";
+  case 110:
+    return "n";
+  case 111:
+    return "o";
+  case 112:
+    return "p";
+  case 113:
+    return "q";
+  case 114:
+    return "r";
+  case 115:
+    return "s";
+  case 116:
+    return "t";
+  case 117:
+    return "u";
+  case 118:
+    return "v";
+  case 119:
+    return "w";
+  case 120:
+    return "x";
+  case 121:
+    return "y";
+  case 122:
+    return "z";
+  case 123:
+    return "{";
+  case 124:
+    return "|";
+  case 125:
+    return "}";
+  case 126:
+    return "~";
+  case 127:
+    return "\\x7F";
+  case 128:
+    return "\\x80";
+  case 129:
+    return "\\x81";
+  case 130:
+    return "\\x82";
+  case 131:
+    return "\\x83";
+  case 132:
+    return "\\x84";
+  case 133:
+    return "\\x85";
+  case 134:
+    return "\\x86";
+  case 135:
+    return "\\x87";
+  case 136:
+    return "\\x88";
+  case 137:
+    return "\\x89";
+  case 138:
+    return "\\x8A";
+  case 139:
+    return "\\x8B";
+  case 140:
+    return "\\x8C";
+  case 141:
+    return "\\x8D";
+  case 142:
+    return "\\x8E";
+  case 143:
+    return "\\x8F";
+  case 144:
+    return "\\x90";
+  case 145:
+    return "\\x91";
+  case 146:
+    return "\\x92";
+  case 147:
+    return "\\x93";
+  case 148:
+    return "\\x94";
+  case 149:
+    return "\\x95";
+  case 150:
+    return "\\x96";
+  case 151:
+    return "\\x97";
+  case 152:
+    return "\\x98";
+  case 153:
+    return "\\x99";
+  case 154:
+    return "\\x9A";
+  case 155:
+    return "\\x9B";
+  case 156:
+    return "\\x9C";
+  case 157:
+    return "\\x9D";
+  case 158:
+    return "\\x9E";
+  case 159:
+    return "\\x9F";
+  case 160:
+    return "\\xA0";
+  case 161:
+    return "\\xA1";
+  case 162:
+    return "\\xA2";
+  case 163:
+    return "\\xA3";
+  case 164:
+    return "\\xA4";
+  case 165:
+    return "\\xA5";
+  case 166:
+    return "\\xA6";
+  case 167:
+    return "\\xA7";
+  case 168:
+    return "\\xA8";
+  case 169:
+    return "\\xA9";
+  case 170:
+    return "\\xAA";
+  case 171:
+    return "\\xAB";
+  case 172:
+    return "\\xAC";
+  case 173:
+    return "\\xAD";
+  case 174:
+    return "\\xAE";
+  case 175:
+    return "\\xAF";
+  case 176:
+    return "\\xB0";
+  case 177:
+    return "\\xB1";
+  case 178:
+    return "\\xB2";
+  case 179:
+    return "\\xB3";
+  case 180:
+    return "\\xB4";
+  case 181:
+    return "\\xB5";
+  case 182:
+    return "\\xB6";
+  case 183:
+    return "\\xB7";
+  case 184:
+    return "\\xB8";
+  case 185:
+    return "\\xB9";
+  case 186:
+    return "\\xBA";
+  case 187:
+    return "\\xBB";
+  case 188:
+    return "\\xBC";
+  case 189:
+    return "\\xBD";
+  case 190:
+    return "\\xBE";
+  case 191:
+    return "\\xBF";
+  case 192:
+    return "\\xC0";
+  case 193:
+    return "\\xC1";
+  case 194:
+    return "\\xC2";
+  case 195:
+    return "\\xC3";
+  case 196:
+    return "\\xC4";
+  case 197:
+    return "\\xC5";
+  case 198:
+    return "\\xC6";
+  case 199:
+    return "\\xC7";
+  case 200:
+    return "\\xC8";
+  case 201:
+    return "\\xC9";
+  case 202:
+    return "\\xCA";
+  case 203:
+    return "\\xCB";
+  case 204:
+    return "\\xCC";
+  case 205:
+    return "\\xCD";
+  case 206:
+    return "\\xCE";
+  case 207:
+    return "\\xCF";
+  case 208:
+    return "\\xD0";
+  case 209:
+    return "\\xD1";
+  case 210:
+    return "\\xD2";
+  case 211:
+    return "\\xD3";
+  case 212:
+    return "\\xD4";
+  case 213:
+    return "\\xD5";
+  case 214:
+    return "\\xD6";
+  case 215:
+    return "\\xD7";
+  case 216:
+    return "\\xD8";
+  case 217:
+    return "\\xD9";
+  case 218:
+    return "\\xDA";
+  case 219:
+    return "\\xDB";
+  case 220:
+    return "\\xDC";
+  case 221:
+    return "\\xDD";
+  case 222:
+    return "\\xDE";
+  case 223:
+    return "\\xDF";
+  case 224:
+    return "\\xE0";
+  case 225:
+    return "\\xE1";
+  case 226:
+    return "\\xE2";
+  case 227:
+    return "\\xE3";
+  case 228:
+    return "\\xE4";
+  case 229:
+    return "\\xE5";
+  case 230:
+    return "\\xE6";
+  case 231:
+    return "\\xE7";
+  case 232:
+    return "\\xE8";
+  case 233:
+    return "\\xE9";
+  case 234:
+    return "\\xEA";
+  case 235:
+    return "\\xEB";
+  case 236:
+    return "\\xEC";
+  case 237:
+    return "\\xED";
+  case 238:
+    return "\\xEE";
+  case 239:
+    return "\\xEF";
+  case 240:
+    return "\\xF0";
+  case 241:
+    return "\\xF1";
+  case 242:
+    return "\\xF2";
+  case 243:
+    return "\\xF3";
+  case 244:
+    return "\\xF4";
+  case 245:
+    return "\\xF5";
+  case 246:
+    return "\\xF6";
+  case 247:
+    return "\\xF7";
+  case 248:
+    return "\\xF8";
+  case 249:
+    return "\\xF9";
+  case 250:
+    return "\\xFA";
+  case 251:
+    return "\\xFB";
+  case 252:
+    return "\\xFC";
+  case 253:
+    return "\\xFD";
+  case 254:
+    return "\\xFE";
+  case 255:
+    return "\\xFF";
+  }
+  assert(0); /* never get's here */
+}
+
+static void
+_ACCOUNT_DIFF_STR(XML_Parser targetParser, XML_Parser originParser, int tok,
+                  const char *before, const char *after, int source_line,
+                  enum XML_Account account) {
+  if (tok < 0)
+    return; /* pointer `after` may not be set */
+  if (account == XML_ACCOUNT_NONE)
+    return; /* because these bytes have been accounted for, already */
+
+  const ptrdiff_t bytesMore = after - before;
+  const int isDirect
+      = (account == XML_ACCOUNT_DIRECT) && (targetParser == originParser);
+
+  if (isDirect) {
+    targetParser->m_accounting.countBytesDirect += bytesMore;
+  } else {
+    targetParser->m_accounting.countBytesIndirect += bytesMore;
+  }
+
+  if (targetParser->m_parentParser) {
+    _ACCOUNT_DIFF_STR(targetParser->m_parentParser, originParser, tok, before,
+                      after, source_line, account);
+    return; /* i.e. limit info printing to parser at the the very top */
+  }
+
+  const double inputOutputRatio
+      = targetParser->m_accounting.countBytesDirect
+            ? ((targetParser->m_accounting.countBytesDirect
+                + targetParser->m_accounting.countBytesIndirect)
+               / (double)(targetParser->m_accounting.countBytesDirect))
+            : 1.0;
+
+  fprintf(stderr,
+          "Accounting: Direct bytes %9lld, indirect bytes %9lld, ratio %5.2f"
+          " (+%5ld bytes %s|%s, line %d) %*s\"",
+          targetParser->m_accounting.countBytesDirect,
+          targetParser->m_accounting.countBytesIndirect, inputOutputRatio,
+          bytesMore, (targetParser == originParser) ? "INT" : "EXT",
+          (account == XML_ACCOUNT_DIRECT) ? "DIR" : "EXP", source_line, 20, "");
+  const char *walker = before;
+  for (; walker < after; walker++) {
+    fprintf(stderr, "%s", _unsigned_char_to_printable(walker[0]));
+  }
+  fprintf(stderr, "\"\n");
+}
+
+static void
+_ENTITY_PRINT_STATS_PREFIX(XML_Parser parser, ENTITY *entity,
+                           const char *action, int sourceLine) {
+  fprintf(
+      stderr,
+      "Entities: Count %9d, depth %2d/%2d %*s%s%s; %s length %d (line %d)\n",
+      parser->m_entity_stats.countEverOpened,
+      parser->m_entity_stats.currentDepth,
+      parser->m_entity_stats.maximumDepthSeen,
+      (parser->m_entity_stats.currentDepth - 1) * 2, "",
+      entity->is_param ? "%" : "&", entity->name, action, entity->textLen,
+      sourceLine);
+}
+
+static void
+_ENTITY_ON_OPEN(XML_Parser parser, ENTITY *entity, int sourceLine) {
+  if (parser->m_parentParser) {
+    _ENTITY_ON_OPEN(parser->m_parentParser, entity, sourceLine);
+    return;
+  }
+
+  parser->m_entity_stats.countEverOpened++;
+  parser->m_entity_stats.currentDepth++;
+  if (parser->m_entity_stats.currentDepth
+      > parser->m_entity_stats.maximumDepthSeen) {
+    parser->m_entity_stats.maximumDepthSeen++;
+  }
+
+  _ENTITY_PRINT_STATS_PREFIX(parser, entity, "OPEN ", sourceLine);
+}
+
+static void
+_ENTITY_ON_CLOSE(XML_Parser parser, ENTITY *entity, int sourceLine) {
+  if (parser->m_parentParser) {
+    _ENTITY_ON_CLOSE(parser->m_parentParser, entity, sourceLine);
+    return;
+  }
+
+  _ENTITY_PRINT_STATS_PREFIX(parser, entity, "CLOSE", sourceLine);
+  parser->m_entity_stats.currentDepth--;
+}
+#endif
+
 static enum XML_Error PTRCALL
 externalEntityInitProcessor2(XML_Parser parser, const char *start,
                              const char *end, const char **endPtr) {
   const char *next = start; /* XmlContentTok doesn't always set the last arg */
   int tok = XmlContentTok(parser->m_encoding, start, end, &next);
+#ifdef XML_DTD
+  _ACCOUNT_DIFF_STR(parser, parser, tok, start, next, __LINE__,
+                    XML_ACCOUNT_DIRECT);
+#endif
   switch (tok) {
   case XML_TOK_BOM:
     /* If we are at the end of the buffer, this would cause the next stage,
@@ -2524,6 +3181,10 @@ externalEntityInitProcessor3(XML_Parser parser, const char *start,
   const char *next = start; /* XmlContentTok doesn't always set the last arg */
   parser->m_eventPtr = start;
   tok = XmlContentTok(parser->m_encoding, start, end, &next);
+#ifdef XML_DTD
+  _ACCOUNT_DIFF_STR(parser, parser, tok, start, next, __LINE__,
+                    XML_ACCOUNT_DIRECT);
+#endif
   parser->m_eventEndPtr = next;
 
   switch (tok) {
@@ -2563,9 +3224,9 @@ externalEntityInitProcessor3(XML_Parser parser, const char *start,
 static enum XML_Error PTRCALL
 externalEntityContentProcessor(XML_Parser parser, const char *start,
                                const char *end, const char **endPtr) {
-  enum XML_Error result
-      = doContent(parser, 1, parser->m_encoding, start, end, endPtr,
-                  (XML_Bool)! parser->m_parsingStatus.finalBuffer);
+  enum XML_Error result = doContent(
+      parser, 1, parser->m_encoding, start, end, endPtr,
+      (XML_Bool)! parser->m_parsingStatus.finalBuffer, XML_ACCOUNT_DIRECT);
   if (result == XML_ERROR_NONE) {
     if (! storeRawNames(parser))
       return XML_ERROR_NO_MEMORY;
@@ -2576,7 +3237,7 @@ externalEntityContentProcessor(XML_Parser parser, const char *start,
 static enum XML_Error
 doContent(XML_Parser parser, int startTagLevel, const ENCODING *enc,
           const char *s, const char *end, const char **nextPtr,
-          XML_Bool haveMore) {
+          XML_Bool haveMore, enum XML_Account account) {
   /* save one level of indirection */
   DTD *const dtd = parser->m_dtd;
 
@@ -2594,6 +3255,9 @@ doContent(XML_Parser parser, int startTagLevel, const ENCODING *enc,
   for (;;) {
     const char *next = s; /* XmlContentTok doesn't always set the last arg */
     int tok = XmlContentTok(enc, s, end, &next);
+#ifdef XML_DTD
+    _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__, account);
+#endif
     *eventEndPP = next;
     switch (tok) {
     case XML_TOK_TRAILING_CR:
@@ -2767,7 +3431,8 @@ doContent(XML_Parser parser, int startTagLevel, const ENCODING *enc,
       }
       tag->name.str = (XML_Char *)tag->buf;
       *toPtr = XML_T('\0');
-      result = storeAtts(parser, enc, s, &(tag->name), &(tag->bindings));
+      result
+          = storeAtts(parser, enc, s, &(tag->name), &(tag->bindings), account);
       if (result)
         return result;
       if (parser->m_startElementHandler)
@@ -2791,7 +3456,8 @@ doContent(XML_Parser parser, int startTagLevel, const ENCODING *enc,
       if (! name.str)
         return XML_ERROR_NO_MEMORY;
       poolFinish(&parser->m_tempPool);
-      result = storeAtts(parser, enc, s, &name, &bindings);
+      result = storeAtts(parser, enc, s, &name, &bindings,
+                         XML_ACCOUNT_NONE /* token spans whole start tag */);
       if (result != XML_ERROR_NONE) {
         freeBindings(parser, bindings);
         return result;
@@ -3055,7 +3721,8 @@ freeBindings(XML_Parser parser, BINDING *bindings) {
 */
 static enum XML_Error
 storeAtts(XML_Parser parser, const ENCODING *enc, const char *attStr,
-          TAG_NAME *tagNamePtr, BINDING **bindingsPtr) {
+          TAG_NAME *tagNamePtr, BINDING **bindingsPtr,
+          enum XML_Account account) {
   DTD *const dtd = parser->m_dtd; /* save one level of indirection */
   ELEMENT_TYPE *elementType;
   int nDefaultAtts;
@@ -3165,7 +3832,7 @@ storeAtts(XML_Parser parser, const ENCODING *enc, const char *attStr,
       /* normalize the attribute value */
       result = storeAttributeValue(
           parser, enc, isCdata, parser->m_atts[i].valuePtr,
-          parser->m_atts[i].valueEnd, &parser->m_tempPool);
+          parser->m_atts[i].valueEnd, &parser->m_tempPool, account);
       if (result)
         return result;
       appAtts[attIndex] = poolStart(&parser->m_tempPool);
@@ -3594,6 +4261,10 @@ doCdataSection(XML_Parser parser, const ENCODING *enc, const char **startPtr,
   for (;;) {
     const char *next = s; /* in case of XML_TOK_NONE or XML_TOK_PARTIAL */
     int tok = XmlCdataSectionTok(enc, s, end, &next);
+#ifdef XML_DTD
+    _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__,
+                      XML_ACCOUNT_DIRECT);
+#endif
     *eventEndPP = next;
     switch (tok) {
     case XML_TOK_CDATA_SECT_CLOSE:
@@ -3738,6 +4409,9 @@ doIgnoreSection(XML_Parser parser, const ENCODING *enc, const char **startPtr,
   *eventPP = s;
   *startPtr = NULL;
   tok = XmlIgnoreSectionTok(enc, s, end, &next);
+#  ifdef XML_DTD
+  _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__, XML_ACCOUNT_DIRECT);
+#  endif
   *eventEndPP = next;
   switch (tok) {
   case XML_TOK_IGNORE_SECT:
@@ -3971,6 +4645,10 @@ entityValueInitProcessor(XML_Parser parser, const char *s, const char *end,
 
   for (;;) {
     tok = XmlPrologTok(parser->m_encoding, start, end, &next);
+#  ifdef XML_DTD
+    _ACCOUNT_DIFF_STR(parser, parser, tok, start, next, __LINE__,
+                      XML_ACCOUNT_DIRECT);
+#  endif
     parser->m_eventEndPtr = next;
     if (tok <= 0) {
       if (! parser->m_parsingStatus.finalBuffer && tok != XML_TOK_INVALID) {
@@ -4039,6 +4717,7 @@ externalParEntProcessor(XML_Parser parser, const char *s, const char *end,
   int tok;
 
   tok = XmlPrologTok(parser->m_encoding, s, end, &next);
+  /* Note: Not calling _ACCOUNT_DIFF_STR here to not count those bytes twices */
   if (tok <= 0) {
     if (! parser->m_parsingStatus.finalBuffer && tok != XML_TOK_INVALID) {
       *nextPtr = s;
@@ -4063,11 +4742,16 @@ externalParEntProcessor(XML_Parser parser, const char *s, const char *end,
   else if (tok == XML_TOK_BOM) {
     s = next;
     tok = XmlPrologTok(parser->m_encoding, s, end, &next);
+#  ifdef XML_DTD
+    _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__,
+                      XML_ACCOUNT_DIRECT);
+#  endif
   }
 
   parser->m_processor = prologProcessor;
   return doProlog(parser, parser->m_encoding, s, end, tok, next, nextPtr,
-                  (XML_Bool)! parser->m_parsingStatus.finalBuffer, XML_TRUE);
+                  (XML_Bool)! parser->m_parsingStatus.finalBuffer, XML_TRUE,
+                  XML_ACCOUNT_DIRECT);
 }
 
 static enum XML_Error PTRCALL
@@ -4080,6 +4764,10 @@ entityValueProcessor(XML_Parser parser, const char *s, const char *end,
 
   for (;;) {
     tok = XmlPrologTok(enc, start, end, &next);
+#  ifdef XML_DTD
+    _ACCOUNT_DIFF_STR(parser, parser, tok, start, next, __LINE__,
+                      XML_ACCOUNT_DIRECT);
+#  endif
     if (tok <= 0) {
       if (! parser->m_parsingStatus.finalBuffer && tok != XML_TOK_INVALID) {
         *nextPtr = s;
@@ -4110,14 +4798,16 @@ prologProcessor(XML_Parser parser, const char *s, const char *end,
                 const char **nextPtr) {
   const char *next = s;
   int tok = XmlPrologTok(parser->m_encoding, s, end, &next);
+  /* Note: Not calling _ACCOUNT_DIFF_STR here to not count those bytes twices */
   return doProlog(parser, parser->m_encoding, s, end, tok, next, nextPtr,
-                  (XML_Bool)! parser->m_parsingStatus.finalBuffer, XML_TRUE);
+                  (XML_Bool)! parser->m_parsingStatus.finalBuffer, XML_TRUE,
+                  XML_ACCOUNT_DIRECT);
 }
 
 static enum XML_Error
 doProlog(XML_Parser parser, const ENCODING *enc, const char *s, const char *end,
          int tok, const char *next, const char **nextPtr, XML_Bool haveMore,
-         XML_Bool allowClosingDoctype) {
+         XML_Bool allowClosingDoctype, enum XML_Account account) {
 #ifdef XML_DTD
   static const XML_Char externalSubsetName[] = {ASCII_HASH, '\0'};
 #endif /* XML_DTD */
@@ -4208,6 +4898,9 @@ doProlog(XML_Parser parser, const ENCODING *enc, const char *s, const char *end,
       }
     }
     role = XmlTokenRole(&parser->m_prologState, tok, s, next, enc);
+#ifdef XML_DTD
+    _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__, account);
+#endif
     switch (role) {
     case XML_ROLE_XML_DECL: {
       enum XML_Error result = processXmlDecl(parser, 0, s, next);
@@ -4483,7 +5176,8 @@ doProlog(XML_Parser parser, const ENCODING *enc, const char *s, const char *end,
         const XML_Char *attVal;
         enum XML_Error result = storeAttributeValue(
             parser, enc, parser->m_declAttributeIsCdata,
-            s + enc->minBytesPerChar, next - enc->minBytesPerChar, &dtd->pool);
+            s + enc->minBytesPerChar, next - enc->minBytesPerChar, &dtd->pool,
+            account);
         if (result)
           return result;
         attVal = poolStart(&dtd->pool);
@@ -4907,12 +5601,15 @@ doProlog(XML_Parser parser, const ENCODING *enc, const char *s, const char *end,
         if (parser->m_externalEntityRefHandler) {
           dtd->paramEntityRead = XML_FALSE;
           entity->open = XML_TRUE;
+          _ENTITY_ON_OPEN(parser, entity, __LINE__);
           if (! parser->m_externalEntityRefHandler(
                   parser->m_externalEntityRefHandlerArg, 0, entity->base,
                   entity->systemId, entity->publicId)) {
+            _ENTITY_ON_CLOSE(parser, entity, __LINE__);
             entity->open = XML_FALSE;
             return XML_ERROR_EXTERNAL_ENTITY_HANDLING;
           }
+          _ENTITY_ON_CLOSE(parser, entity, __LINE__);
           entity->open = XML_FALSE;
           handleDefault = XML_FALSE;
           if (! dtd->paramEntityRead) {
@@ -5097,6 +5794,8 @@ doProlog(XML_Parser parser, const ENCODING *enc, const char *s, const char *end,
     default:
       s = next;
       tok = XmlPrologTok(enc, s, end, &next);
+      /* Note: Not calling _ACCOUNT_DIFF_STR here to not count those bytes
+       * twices */
     }
   }
   /* not reached */
@@ -5110,6 +5809,10 @@ epilogProcessor(XML_Parser parser, const char *s, const char *end,
   for (;;) {
     const char *next = NULL;
     int tok = XmlPrologTok(parser->m_encoding, s, end, &next);
+#ifdef XML_DTD
+    _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__,
+                      XML_ACCOUNT_DIRECT);
+#endif
     parser->m_eventEndPtr = next;
     switch (tok) {
     /* report partial linebreak - it might be the last token */
@@ -5183,6 +5886,7 @@ processInternalEntity(XML_Parser parser, ENTITY *entity, XML_Bool betweenDecl) {
       return XML_ERROR_NO_MEMORY;
   }
   entity->open = XML_TRUE;
+  _ENTITY_ON_OPEN(parser, entity, __LINE__);
   entity->processed = 0;
   openEntity->next = parser->m_openInternalEntities;
   parser->m_openInternalEntities = openEntity;
@@ -5200,18 +5904,23 @@ processInternalEntity(XML_Parser parser, ENTITY *entity, XML_Bool betweenDecl) {
   if (entity->is_param) {
     int tok
         = XmlPrologTok(parser->m_internalEncoding, textStart, textEnd, &next);
+    _ACCOUNT_DIFF_STR(parser, parser, tok, textStart, next, __LINE__,
+                      XML_ACCOUNT_ENTITY_EXPANSION);
     result = doProlog(parser, parser->m_internalEncoding, textStart, textEnd,
-                      tok, next, &next, XML_FALSE, XML_FALSE);
+                      tok, next, &next, XML_FALSE, XML_FALSE,
+                      XML_ACCOUNT_ENTITY_EXPANSION);
   } else
 #endif /* XML_DTD */
     result = doContent(parser, parser->m_tagLevel, parser->m_internalEncoding,
-                       textStart, textEnd, &next, XML_FALSE);
+                       textStart, textEnd, &next, XML_FALSE,
+                       XML_ACCOUNT_ENTITY_EXPANSION);
 
   if (result == XML_ERROR_NONE) {
     if (textEnd != next && parser->m_parsingStatus.parsing == XML_SUSPENDED) {
       entity->processed = (int)(next - textStart);
       parser->m_processor = internalEntityProcessor;
     } else {
+      _ENTITY_ON_CLOSE(parser, entity, __LINE__);
       entity->open = XML_FALSE;
       parser->m_openInternalEntities = openEntity->next;
       /* put openEntity back in list of free instances */
@@ -5243,13 +5952,16 @@ internalEntityProcessor(XML_Parser parser, const char *s, const char *end,
   if (entity->is_param) {
     int tok
         = XmlPrologTok(parser->m_internalEncoding, textStart, textEnd, &next);
+    _ACCOUNT_DIFF_STR(parser, parser, tok, textStart, next, __LINE__,
+                      XML_ACCOUNT_ENTITY_EXPANSION);
     result = doProlog(parser, parser->m_internalEncoding, textStart, textEnd,
-                      tok, next, &next, XML_FALSE, XML_TRUE);
+                      tok, next, &next, XML_FALSE, XML_TRUE,
+                      XML_ACCOUNT_ENTITY_EXPANSION);
   } else
 #endif /* XML_DTD */
     result = doContent(parser, openEntity->startTagLevel,
                        parser->m_internalEncoding, textStart, textEnd, &next,
-                       XML_FALSE);
+                       XML_FALSE, XML_ACCOUNT_ENTITY_EXPANSION);
 
   if (result != XML_ERROR_NONE)
     return result;
@@ -5258,6 +5970,7 @@ internalEntityProcessor(XML_Parser parser, const char *s, const char *end,
     entity->processed = (int)(next - (char *)entity->textPtr);
     return result;
   } else {
+    _ENTITY_ON_CLOSE(parser, entity, __LINE__);
     entity->open = XML_FALSE;
     parser->m_openInternalEntities = openEntity->next;
     /* put openEntity back in list of free instances */
@@ -5270,8 +5983,11 @@ internalEntityProcessor(XML_Parser parser, const char *s, const char *end,
     int tok;
     parser->m_processor = prologProcessor;
     tok = XmlPrologTok(parser->m_encoding, s, end, &next);
+    _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__,
+                      XML_ACCOUNT_DIRECT);
     return doProlog(parser, parser->m_encoding, s, end, tok, next, nextPtr,
-                    (XML_Bool)! parser->m_parsingStatus.finalBuffer, XML_TRUE);
+                    (XML_Bool)! parser->m_parsingStatus.finalBuffer, XML_TRUE,
+                    XML_ACCOUNT_DIRECT);
   } else
 #endif /* XML_DTD */
   {
@@ -5279,7 +5995,8 @@ internalEntityProcessor(XML_Parser parser, const char *s, const char *end,
     /* see externalEntityContentProcessor vs contentProcessor */
     return doContent(parser, parser->m_parentParser ? 1 : 0, parser->m_encoding,
                      s, end, nextPtr,
-                     (XML_Bool)! parser->m_parsingStatus.finalBuffer);
+                     (XML_Bool)! parser->m_parsingStatus.finalBuffer,
+                     XML_ACCOUNT_DIRECT);
   }
 }
 
@@ -5294,9 +6011,10 @@ errorProcessor(XML_Parser parser, const char *s, const char *end,
 
 static enum XML_Error
 storeAttributeValue(XML_Parser parser, const ENCODING *enc, XML_Bool isCdata,
-                    const char *ptr, const char *end, STRING_POOL *pool) {
+                    const char *ptr, const char *end, STRING_POOL *pool,
+                    enum XML_Account account) {
   enum XML_Error result
-      = appendAttributeValue(parser, enc, isCdata, ptr, end, pool);
+      = appendAttributeValue(parser, enc, isCdata, ptr, end, pool, account);
   if (result)
     return result;
   if (! isCdata && poolLength(pool) && poolLastChar(pool) == 0x20)
@@ -5308,11 +6026,15 @@ storeAttributeValue(XML_Parser parser, const ENCODING *enc, XML_Bool isCdata,
 
 static enum XML_Error
 appendAttributeValue(XML_Parser parser, const ENCODING *enc, XML_Bool isCdata,
-                     const char *ptr, const char *end, STRING_POOL *pool) {
+                     const char *ptr, const char *end, STRING_POOL *pool,
+                     enum XML_Account account) {
   DTD *const dtd = parser->m_dtd; /* save one level of indirection */
   for (;;) {
     const char *next;
     int tok = XmlAttributeValueTok(enc, ptr, end, &next);
+#ifdef XML_DTD
+    _ACCOUNT_DIFF_STR(parser, parser, tok, ptr, next, __LINE__, account);
+#endif
     switch (tok) {
     case XML_TOK_NONE:
       return XML_ERROR_NONE;
@@ -5449,9 +6171,12 @@ appendAttributeValue(XML_Parser parser, const ENCODING *enc, XML_Bool isCdata,
         enum XML_Error result;
         const XML_Char *textEnd = entity->textPtr + entity->textLen;
         entity->open = XML_TRUE;
-        result = appendAttributeValue(parser, parser->m_internalEncoding,
-                                      isCdata, (char *)entity->textPtr,
-                                      (char *)textEnd, pool);
+        _ENTITY_ON_OPEN(parser, entity, __LINE__);
+        result
+            = appendAttributeValue(parser, parser->m_internalEncoding, isCdata,
+                                   (char *)entity->textPtr, (char *)textEnd,
+                                   pool, XML_ACCOUNT_ENTITY_EXPANSION);
+        _ENTITY_ON_CLOSE(parser, entity, __LINE__);
         entity->open = XML_FALSE;
         if (result)
           return result;
@@ -5500,6 +6225,8 @@ storeEntityValue(XML_Parser parser, const ENCODING *enc,
   for (;;) {
     const char *next;
     int tok = XmlEntityValueTok(enc, entityTextPtr, entityTextEnd, &next);
+    /* Note: Not calling _ACCOUNT_DIFF_STR here to not count those bytes twices
+     */
     switch (tok) {
     case XML_TOK_PARAM_ENTITY_REF:
 #ifdef XML_DTD
@@ -5535,13 +6262,16 @@ storeEntityValue(XML_Parser parser, const ENCODING *enc,
           if (parser->m_externalEntityRefHandler) {
             dtd->paramEntityRead = XML_FALSE;
             entity->open = XML_TRUE;
+            _ENTITY_ON_OPEN(parser, entity, __LINE__);
             if (! parser->m_externalEntityRefHandler(
                     parser->m_externalEntityRefHandlerArg, 0, entity->base,
                     entity->systemId, entity->publicId)) {
+              _ENTITY_ON_CLOSE(parser, entity, __LINE__);
               entity->open = XML_FALSE;
               result = XML_ERROR_EXTERNAL_ENTITY_HANDLING;
               goto endEntityValue;
             }
+            _ENTITY_ON_CLOSE(parser, entity, __LINE__);
             entity->open = XML_FALSE;
             if (! dtd->paramEntityRead)
               dtd->keepProcessing = dtd->standalone;
@@ -5549,9 +6279,11 @@ storeEntityValue(XML_Parser parser, const ENCODING *enc,
             dtd->keepProcessing = dtd->standalone;
         } else {
           entity->open = XML_TRUE;
+          _ENTITY_ON_OPEN(parser, entity, __LINE__);
           result = storeEntityValue(
               parser, parser->m_internalEncoding, (char *)entity->textPtr,
               (char *)(entity->textPtr + entity->textLen));
+          _ENTITY_ON_CLOSE(parser, entity, __LINE__);
           entity->open = XML_FALSE;
           if (result)
             goto endEntityValue;
