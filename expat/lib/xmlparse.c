@@ -394,6 +394,7 @@ typedef long long XmlBigCount;
 typedef struct accounting {
   XmlBigCount countBytesDirect;
   XmlBigCount countBytesIndirect;
+  double peakInputOutputRatio;
 } ACCOUNTING;
 
 typedef struct entity_stats {
@@ -3075,14 +3076,19 @@ _ACCOUNT_DIFF_STR(XML_Parser targetParser, XML_Parser originParser, int tok,
                 + targetParser->m_accounting.countBytesIndirect)
                / (double)(targetParser->m_accounting.countBytesDirect))
             : 1.0;
+  if (inputOutputRatio > targetParser->m_accounting.peakInputOutputRatio) {
+    targetParser->m_accounting.peakInputOutputRatio = inputOutputRatio;
+  }
 
-  fprintf(stderr,
-          "Accounting: Direct bytes %9lld, indirect bytes %9lld, ratio %5.2f"
-          " (+%5ld bytes %s|%s, line %d) %*s\"",
-          targetParser->m_accounting.countBytesDirect,
-          targetParser->m_accounting.countBytesIndirect, inputOutputRatio,
-          bytesMore, (targetParser == originParser) ? "INT" : "EXT",
-          (account == XML_ACCOUNT_DIRECT) ? "DIR" : "EXP", source_line, 20, "");
+  fprintf(
+      stderr,
+      "Accounting: Direct bytes %9lld, indirect bytes %9lld, ratio %8.2f/%8.2f"
+      " (+%5ld bytes %s|%s, line %d) %*s\"",
+      targetParser->m_accounting.countBytesDirect,
+      targetParser->m_accounting.countBytesIndirect, inputOutputRatio,
+      targetParser->m_accounting.peakInputOutputRatio, bytesMore,
+      (targetParser == originParser) ? "INT" : "EXT",
+      (account == XML_ACCOUNT_DIRECT) ? "DIR" : "EXP", source_line, 20, "");
   const char *walker = before;
   for (; walker < after; walker++) {
     fprintf(stderr, "%s", _unsigned_char_to_printable(walker[0]));
