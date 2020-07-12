@@ -2517,8 +2517,8 @@ externalEntityInitProcessor(XML_Parser parser, const char *start,
 #ifdef XML_DTD
 static const char *_unsigned_char_to_printable(unsigned char c);
 
-static void _ACCOUNT_DIFF_STR(XML_Parser targetParser, XML_Parser originParser,
-                              int tok, const char *before, const char *after,
+static void _ACCOUNT_DIFF_STR(XML_Parser originParser, int tok,
+                              const char *before, const char *after,
                               int source_line, enum XML_Account account);
 
 static void _ENTITY_PRINT_STATS_PREFIX(XML_Parser parser, ENTITY *entity,
@@ -3046,8 +3046,8 @@ _unsigned_char_to_printable(unsigned char c) {
 }
 
 static void
-_ACCOUNT_DIFF_STR(XML_Parser targetParser, XML_Parser originParser, int tok,
-                  const char *before, const char *after, int source_line,
+_ACCOUNT_DIFF_STR(XML_Parser originParser, int tok, const char *before,
+                  const char *after, int source_line,
                   enum XML_Account account) {
   if (tok < 0)
     return; /* pointer `after` may not be set */
@@ -3055,39 +3055,37 @@ _ACCOUNT_DIFF_STR(XML_Parser targetParser, XML_Parser originParser, int tok,
     return; /* because these bytes have been accounted for, already */
 
   const ptrdiff_t bytesMore = after - before;
+
+  XML_Parser rootParser = originParser;
+  while (rootParser->m_parentParser)
+    rootParser = rootParser->m_parentParser;
+
   const int isDirect
-      = (account == XML_ACCOUNT_DIRECT) && (targetParser == originParser);
-
+      = (account == XML_ACCOUNT_DIRECT) && (originParser == rootParser);
   if (isDirect) {
-    targetParser->m_accounting.countBytesDirect += bytesMore;
+    rootParser->m_accounting.countBytesDirect += bytesMore;
   } else {
-    targetParser->m_accounting.countBytesIndirect += bytesMore;
-  }
-
-  if (targetParser->m_parentParser) {
-    _ACCOUNT_DIFF_STR(targetParser->m_parentParser, originParser, tok, before,
-                      after, source_line, account);
-    return; /* i.e. limit info printing to parser at the the very top */
+    rootParser->m_accounting.countBytesIndirect += bytesMore;
   }
 
   const double inputOutputRatio
-      = targetParser->m_accounting.countBytesDirect
-            ? ((targetParser->m_accounting.countBytesDirect
-                + targetParser->m_accounting.countBytesIndirect)
-               / (double)(targetParser->m_accounting.countBytesDirect))
+      = rootParser->m_accounting.countBytesDirect
+            ? ((rootParser->m_accounting.countBytesDirect
+                + rootParser->m_accounting.countBytesIndirect)
+               / (double)(rootParser->m_accounting.countBytesDirect))
             : 1.0;
-  if (inputOutputRatio > targetParser->m_accounting.peakInputOutputRatio) {
-    targetParser->m_accounting.peakInputOutputRatio = inputOutputRatio;
+  if (inputOutputRatio > rootParser->m_accounting.peakInputOutputRatio) {
+    rootParser->m_accounting.peakInputOutputRatio = inputOutputRatio;
   }
 
   fprintf(
       stderr,
       "Accounting: Direct bytes %9lld, indirect bytes %9lld, ratio %8.2f/%8.2f"
       " (+%5ld bytes %s|%s, line %d) %*s\"",
-      targetParser->m_accounting.countBytesDirect,
-      targetParser->m_accounting.countBytesIndirect, inputOutputRatio,
-      targetParser->m_accounting.peakInputOutputRatio, bytesMore,
-      (targetParser == originParser) ? "INT" : "EXT",
+      rootParser->m_accounting.countBytesDirect,
+      rootParser->m_accounting.countBytesIndirect, inputOutputRatio,
+      rootParser->m_accounting.peakInputOutputRatio, bytesMore,
+      (rootParser == originParser) ? "INT" : "EXT",
       (account == XML_ACCOUNT_DIRECT) ? "DIR" : "EXP", source_line, 20, "");
   const char *walker = before;
   for (; walker < after; walker++) {
@@ -3145,8 +3143,7 @@ externalEntityInitProcessor2(XML_Parser parser, const char *start,
   const char *next = start; /* XmlContentTok doesn't always set the last arg */
   int tok = XmlContentTok(parser->m_encoding, start, end, &next);
 #ifdef XML_DTD
-  _ACCOUNT_DIFF_STR(parser, parser, tok, start, next, __LINE__,
-                    XML_ACCOUNT_DIRECT);
+  _ACCOUNT_DIFF_STR(parser, tok, start, next, __LINE__, XML_ACCOUNT_DIRECT);
 #endif
   switch (tok) {
   case XML_TOK_BOM:
@@ -3188,8 +3185,7 @@ externalEntityInitProcessor3(XML_Parser parser, const char *start,
   parser->m_eventPtr = start;
   tok = XmlContentTok(parser->m_encoding, start, end, &next);
 #ifdef XML_DTD
-  _ACCOUNT_DIFF_STR(parser, parser, tok, start, next, __LINE__,
-                    XML_ACCOUNT_DIRECT);
+  _ACCOUNT_DIFF_STR(parser, tok, start, next, __LINE__, XML_ACCOUNT_DIRECT);
 #endif
   parser->m_eventEndPtr = next;
 
@@ -3262,7 +3258,7 @@ doContent(XML_Parser parser, int startTagLevel, const ENCODING *enc,
     const char *next = s; /* XmlContentTok doesn't always set the last arg */
     int tok = XmlContentTok(enc, s, end, &next);
 #ifdef XML_DTD
-    _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__, account);
+    _ACCOUNT_DIFF_STR(parser, tok, s, next, __LINE__, account);
 #endif
     *eventEndPP = next;
     switch (tok) {
@@ -4268,8 +4264,7 @@ doCdataSection(XML_Parser parser, const ENCODING *enc, const char **startPtr,
     const char *next = s; /* in case of XML_TOK_NONE or XML_TOK_PARTIAL */
     int tok = XmlCdataSectionTok(enc, s, end, &next);
 #ifdef XML_DTD
-    _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__,
-                      XML_ACCOUNT_DIRECT);
+    _ACCOUNT_DIFF_STR(parser, tok, s, next, __LINE__, XML_ACCOUNT_DIRECT);
 #endif
     *eventEndPP = next;
     switch (tok) {
@@ -4416,7 +4411,7 @@ doIgnoreSection(XML_Parser parser, const ENCODING *enc, const char **startPtr,
   *startPtr = NULL;
   tok = XmlIgnoreSectionTok(enc, s, end, &next);
 #  ifdef XML_DTD
-  _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__, XML_ACCOUNT_DIRECT);
+  _ACCOUNT_DIFF_STR(parser, tok, s, next, __LINE__, XML_ACCOUNT_DIRECT);
 #  endif
   *eventEndPP = next;
   switch (tok) {
@@ -4652,8 +4647,7 @@ entityValueInitProcessor(XML_Parser parser, const char *s, const char *end,
   for (;;) {
     tok = XmlPrologTok(parser->m_encoding, start, end, &next);
 #  ifdef XML_DTD
-    _ACCOUNT_DIFF_STR(parser, parser, tok, start, next, __LINE__,
-                      XML_ACCOUNT_DIRECT);
+    _ACCOUNT_DIFF_STR(parser, tok, start, next, __LINE__, XML_ACCOUNT_DIRECT);
 #  endif
     parser->m_eventEndPtr = next;
     if (tok <= 0) {
@@ -4749,8 +4743,7 @@ externalParEntProcessor(XML_Parser parser, const char *s, const char *end,
     s = next;
     tok = XmlPrologTok(parser->m_encoding, s, end, &next);
 #  ifdef XML_DTD
-    _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__,
-                      XML_ACCOUNT_DIRECT);
+    _ACCOUNT_DIFF_STR(parser, tok, s, next, __LINE__, XML_ACCOUNT_DIRECT);
 #  endif
   }
 
@@ -4771,8 +4764,7 @@ entityValueProcessor(XML_Parser parser, const char *s, const char *end,
   for (;;) {
     tok = XmlPrologTok(enc, start, end, &next);
 #  ifdef XML_DTD
-    _ACCOUNT_DIFF_STR(parser, parser, tok, start, next, __LINE__,
-                      XML_ACCOUNT_DIRECT);
+    _ACCOUNT_DIFF_STR(parser, tok, start, next, __LINE__, XML_ACCOUNT_DIRECT);
 #  endif
     if (tok <= 0) {
       if (! parser->m_parsingStatus.finalBuffer && tok != XML_TOK_INVALID) {
@@ -4905,7 +4897,7 @@ doProlog(XML_Parser parser, const ENCODING *enc, const char *s, const char *end,
     }
     role = XmlTokenRole(&parser->m_prologState, tok, s, next, enc);
 #ifdef XML_DTD
-    _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__, account);
+    _ACCOUNT_DIFF_STR(parser, tok, s, next, __LINE__, account);
 #endif
     switch (role) {
     case XML_ROLE_XML_DECL: {
@@ -5816,8 +5808,7 @@ epilogProcessor(XML_Parser parser, const char *s, const char *end,
     const char *next = NULL;
     int tok = XmlPrologTok(parser->m_encoding, s, end, &next);
 #ifdef XML_DTD
-    _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__,
-                      XML_ACCOUNT_DIRECT);
+    _ACCOUNT_DIFF_STR(parser, tok, s, next, __LINE__, XML_ACCOUNT_DIRECT);
 #endif
     parser->m_eventEndPtr = next;
     switch (tok) {
@@ -5910,7 +5901,7 @@ processInternalEntity(XML_Parser parser, ENTITY *entity, XML_Bool betweenDecl) {
   if (entity->is_param) {
     int tok
         = XmlPrologTok(parser->m_internalEncoding, textStart, textEnd, &next);
-    _ACCOUNT_DIFF_STR(parser, parser, tok, textStart, next, __LINE__,
+    _ACCOUNT_DIFF_STR(parser, tok, textStart, next, __LINE__,
                       XML_ACCOUNT_ENTITY_EXPANSION);
     result = doProlog(parser, parser->m_internalEncoding, textStart, textEnd,
                       tok, next, &next, XML_FALSE, XML_FALSE,
@@ -5958,7 +5949,7 @@ internalEntityProcessor(XML_Parser parser, const char *s, const char *end,
   if (entity->is_param) {
     int tok
         = XmlPrologTok(parser->m_internalEncoding, textStart, textEnd, &next);
-    _ACCOUNT_DIFF_STR(parser, parser, tok, textStart, next, __LINE__,
+    _ACCOUNT_DIFF_STR(parser, tok, textStart, next, __LINE__,
                       XML_ACCOUNT_ENTITY_EXPANSION);
     result = doProlog(parser, parser->m_internalEncoding, textStart, textEnd,
                       tok, next, &next, XML_FALSE, XML_TRUE,
@@ -5989,8 +5980,7 @@ internalEntityProcessor(XML_Parser parser, const char *s, const char *end,
     int tok;
     parser->m_processor = prologProcessor;
     tok = XmlPrologTok(parser->m_encoding, s, end, &next);
-    _ACCOUNT_DIFF_STR(parser, parser, tok, s, next, __LINE__,
-                      XML_ACCOUNT_DIRECT);
+    _ACCOUNT_DIFF_STR(parser, tok, s, next, __LINE__, XML_ACCOUNT_DIRECT);
     return doProlog(parser, parser->m_encoding, s, end, tok, next, nextPtr,
                     (XML_Bool)! parser->m_parsingStatus.finalBuffer, XML_TRUE,
                     XML_ACCOUNT_DIRECT);
@@ -6039,7 +6029,7 @@ appendAttributeValue(XML_Parser parser, const ENCODING *enc, XML_Bool isCdata,
     const char *next;
     int tok = XmlAttributeValueTok(enc, ptr, end, &next);
 #ifdef XML_DTD
-    _ACCOUNT_DIFF_STR(parser, parser, tok, ptr, next, __LINE__, account);
+    _ACCOUNT_DIFF_STR(parser, tok, ptr, next, __LINE__, account);
 #endif
     switch (tok) {
     case XML_TOK_NONE:
